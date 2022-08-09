@@ -2,6 +2,7 @@
 
 import bisect
 from dataclasses import InitVar
+import imp
 import os
 from tkinter.messagebox import NO
 
@@ -10,9 +11,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import random
+import math
 
 # dfdcroot='/public/zhaohanqing/workspace/DeepfakeDetectionBench/datasets/dfdc/'
-ffpproot='/data-x/g15/ffpp-faces/'
+ffpproot='/data/zhangxuehai/ffpp-faces/'
 # deeperforensics_root='/public/zhaohanqing/workspace/DeepfakeDetectionBench/datasets/deeper/'
 # fmfcc_root='/public/zhaohanqing/workspace/DeepfakeDetectionBench/datasets/fmfcc/'
 
@@ -40,9 +42,9 @@ class ForensicsClips_new32(Dataset):
         for ds_type in ds_types:
 
             # get list of video names
-            video_paths = os.path.join('/data-x/g17/zhangxuehai/ffpp-faces/', ds_type, compression, 'clips')
+            video_paths = os.path.join('/data/zhangxuehai/ffpp-faces/', ds_type, compression, 'clips')
             if ds_type == 'Origin':
-                videos = sorted(real_videos)*4
+                videos = sorted(real_videos)
             elif ds_type == 'DeeperForensics':  # Extra processing for DeeperForensics videos due to naming differences
                 videos = []
                 for f in fake_videos:
@@ -77,7 +79,7 @@ class ForensicsClips_new32(Dataset):
             clip_idx = idx
         else:
             clip_idx = idx - self.cumulative_sizes[video_idx - 1]
-
+     
         item = self.paths[video_idx]
         path =  item[0]
         label =  0 if item[1] == 'Origin' else 1
@@ -85,12 +87,43 @@ class ForensicsClips_new32(Dataset):
         sample = []
         frames_path = os.path.join(path, str(clip_idx).zfill(4))
         frames = os.listdir(frames_path)
+        n_holes = random.randint(1,3)
+        lengths = []
+        holes = []
+        while 1:
+            length0 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))
+            length1 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))  if n_holes>1 else 0
+            length2 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))  if n_holes>2 else 0
+            s_all = length0**2+length1**2+length2**2
+            if s_all>0.2*224*224 and s_all<0.8*224*224:
+                lengths.append(length0)
+                lengths.append(length1)
+                lengths.append(length2)
+                break
+        
+        for n in range(n_holes):
+            y = np.random.randint(224)
+            x = np.random.randint(224)
+            length = lengths[n]
+            y1 = np.clip(y - length // 2, 0, 224)
+            y2 = np.clip(y + length // 2, 0, 224)
+            x1 = np.clip(x - length // 2, 0, 224)
+            x2 = np.clip(x + length // 2, 0, 224)
+            holes.append([y1,y2,x1,x2])
         for item in frames[:self.frames_per_clip]:
             with Image.open(os.path.join(frames_path, item)) as pil_img:
                 if self.grayscale:
                     pil_img = pil_img.convert("L")
                 if self.transform is not None:
                     img = self.transform(pil_img)
+                    for n in range(n_holes):
+                        mask = np.ones((224, 224), np.float32)
+                        
+                        y1,y2,x1,x2 = holes[n]
+                        mask[y1: y2, x1: x2] = 0.
+                        mask = torch.from_numpy(mask)
+                        mask = mask.expand_as(img)
+                        img = img * mask
                  
             sample.append(img)
         sample = torch.stack(sample,dim=1)
@@ -119,7 +152,7 @@ def load_json(name):
     return a
 
 
-celebroot='/data-x/g12/wp/CelebDFv2_test_clips/'
+celebroot='/data/zhangxuehai/CelebDFv2_test_clips/'
 
 class CelebDFClips(Dataset):
     """Dataset class for Celeb-DF-v2"""
