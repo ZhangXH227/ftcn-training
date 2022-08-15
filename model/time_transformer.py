@@ -220,12 +220,12 @@ class TimeTransformer(nn.Module):
         super().__init__()
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-        # self.num_patches=num_patches
-        # self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        # self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        # self.dropout = nn.Dropout(emb_dropout)
-        #
-        # self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.num_patches=num_patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
 
         self.pool = pool
         self.to_latent = nn.Identity()
@@ -236,19 +236,19 @@ class TimeTransformer(nn.Module):
         )
 
     def forward(self, x):
-        # b, n, _ = x.shape #batch,num_patches,channels  #
-        #
-        # cls_tokens = repeat(self.cls_token, '() n d -> b n d', b = b)
-        # x = torch.cat((cls_tokens, x), dim=1)
-        # x += self.pos_embedding[:, :(n + 1)]
-        # x = self.dropout(x)
-        #
-        # x = self.transformer(x, mask=None)
+        b, n, _ = x.shape #batch,num_patches,channels  #
+        
+        cls_tokens = repeat(self.cls_token, '() n d -> b n d', b = b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+        
+        x = self.transformer(x, mask=None)
         # print('输出1==============',x)
         x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
         # print('输出2==============', x)
         x = self.to_latent(x)
         # print('输出3==============', x)
-        # x1 = nn.LayerNorm(x)
+        x1 = nn.LayerNorm(x)
         # print('输出4==============', x1)
         return self.mlp_head(x)
