@@ -15,24 +15,37 @@ import torch.backends.cudnn as cudnn
 import json
 
 from pathlib import Path
+
+from timm.data import Mixup
+from timm.models import create_model
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
+from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 from model.ftcn import I3D8x8
 from engine import train_one_epoch, evaluate
+from losses import DistillationLoss
+from samplers import RASampler
 import model.optimizer as optim
+# import pvt_v2
 import utils
+import utils_terminal
+import collections
 from data.dataset_clips import CelebDFClips, ForensicsClips_new32
 from data.samplers import ConsecutiveClipSampler
 from torchvision.transforms import Compose, CenterCrop, RandomHorizontalFlip, ToTensor, Normalize
+from tqdm import tqdm
+
+from data.transforms import NormalizeVideo, ToTensorVideo
 import pandas as pd
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('PVT training and evaluation script', add_help=False)
     parser.add_argument('--fp32_resume', action='store_true', default=False)
-    parser.add_argument('--batch_size', default=6, type=int)
+    parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--frames', default=32, type=int)
-    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--epochs', default=90, type=int)
     # parser.add_argument('--config', required=True, type=str, help='config')
     parser.add_argument('--tt_use', default=True)
     # Model parameters
@@ -61,7 +74,7 @@ def get_args_parser():
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
-    parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
@@ -71,7 +84,7 @@ def get_args_parser():
                         help='learning rate noise std-dev (default: 1.0)')
     parser.add_argument('--warmup-lr', type=float, default=0.01, metavar='LR',
                         help='warmup learning rate (default: 1e-6)')
-    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+    parser.add_argument('--min-lr', type=float, default=0, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
 
     parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
@@ -142,7 +155,7 @@ def get_args_parser():
                         help='device to use for training / testing')
     # parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+    parser.add_argument('--start_epoch', default=1, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', default=False, help='Perform evaluation only')
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
@@ -165,54 +178,32 @@ def main(args):
     utils.init_distributed_mode(args)
 
     device = torch.device(args.device)
-
     cudnn.benchmark = True
 
     train_transform = Compose(
-        [CenterCrop(224), RandomHorizontalFlip(), ToTensor(),
+        [RandomHorizontalFlip(), ToTensor(),
          Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
     )
     test_transform = Compose(
-        [CenterCrop(224), ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+        [ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
     )
 
-    train_split = pd.read_json('/data-x/g15/ffpp-faces/train.json', dtype=False)
+    train_split = pd.read_json('/data/zhangxuehai/ffpp-clips/train.json', dtype=False)
     train_files_real, train_files_fake = utils.get_files_from_split(train_split)
 
     # gpu3 bs=2 --> train 15 ; test 25
     # 270 for train and 110 for test, as recommended in FF++
-    real_data = ForensicsClips_new32(train_files_real,
-                                     train_files_fake,
-                                     args.frames,
-                                     grayscale=False,
-                                     compression='c23',
-                                     ds_types=["Origin"],
-                                     transform=train_transform,
-                                     max_frames_per_video=320,
-                                     )
-    fake_data = ForensicsClips_new32(train_files_real,
-                                     train_files_fake,
-                                     args.frames,
-                                     grayscale=False,
-                                     compression='c23',
-                                     ds_types=['Deepfakes', 'FaceSwap', 'Face2Face', 'NeuralTextures'],
-                                     transform=train_transform,
-                                     max_frames_per_video=320,
-                                     )
 
-    train_dataset = torch.utils.data.ConcatDataset([real_data, fake_data])
 
     # 测试集frames可以尝试16
     validate_dataset = CelebDFClips(args.frames, False, test_transform)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    # train_sampler = torch.utils.data.RandomSampler(train_dataset)
     test_sampler = ConsecutiveClipSampler(validate_dataset.clips_per_video)
-    data_loader_train = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler,
-                                                    num_workers=args.num_workers, drop_last=True)
     data_loader_val = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size * 2,
                                                   sampler=test_sampler, num_workers=args.num_workers)
-    print(f"=====>Totally {len(train_dataset)} train video clips...")
     print(f"=====>Totally {len(validate_dataset)} test videos...")
     print(sum(validate_dataset.clips_per_video))
+    print(len(test_sampler))
 
     # 考虑帧间连续性， 去掉mix_up??      --效果不佳
     # 过拟合仍然是重要问题
@@ -225,6 +216,26 @@ def main(args):
     for param in model.parameters():
         param.requires_grad = True
 
+    if args.finetune:
+        if args.finetune.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.finetune, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.finetune, map_location='cpu')
+
+        if 'model' in checkpoint:
+            checkpoint_model = checkpoint['model']
+        else:
+            checkpoint_model = checkpoint
+        state_dict = model.state_dict()
+        # if not ('tcn' in args.model or 'transhead' in args.model):
+        #     for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+        #         if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+        #             # print(f"Removing key {k} from pretrained checkpoint")
+        #             del checkpoint_model[k]
+
+        model.load_state_dict(checkpoint_model, strict=False)
+
     model.to(device)
 
     model_ema = None
@@ -233,6 +244,7 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -248,11 +260,38 @@ def main(args):
         print(f"Auc of the network on the {len(validate_dataset)} test videos: {auc}")
         return
 
-    print(f"Start training for {args.epochs} epochs")
+    print(f"Start training for {args.epochs+args.warmup_epochs} epochs")
     start_time = time.time()
     max_auc = 0.0
+    lr_scheduler.step(args.start_epoch-1)
 
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch, args.epochs+args.warmup_epochs+1):
+        real_data = ForensicsClips_new32(train_files_real,
+                                         train_files_fake,
+                                         args.frames,
+                                         grayscale=False,
+                                         compression='c23',
+                                         ds_types=["Origin"],
+                                         transform=train_transform,
+                                         max_frames_per_video=1440,
+                                         )
+        fake_data = ForensicsClips_new32(train_files_real,
+                                         train_files_fake,
+                                         args.frames,
+                                         grayscale=False,
+                                         compression='c23',
+                                         ds_types=['Deepfakes', 'FaceSwap', 'Face2Face', 'NeuralTextures'],
+                                         #  ds_types=['Face2Face'],
+                                         transform=train_transform,
+                                         max_frames_per_video=1440,
+                                         )
+        train_dataset = torch.utils.data.ConcatDataset([real_data, fake_data])
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        data_loader_train = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
+                                                        sampler=train_sampler,
+                                                        num_workers=args.num_workers, drop_last=True)
+        print(f"=====>Totally {len(train_dataset)} train video clips...")
+
         if args.fp32_resume and epoch > args.start_epoch + 1:
             args.fp32_resume = False
         loss_scaler._scaler = torch.cuda.amp.GradScaler(enabled=not args.fp32_resume)
@@ -264,7 +303,7 @@ def main(args):
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler, threshold,
             args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
+            set_training_mode=True,  # keep in eval mode during finetuning
             fp32=args.fp32_resume
         )
 
@@ -277,7 +316,6 @@ def main(args):
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
-                    # 'model_ema': get_state_dict(model_ema),
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
                 }, checkpoint_path)
