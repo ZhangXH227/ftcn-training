@@ -18,6 +18,31 @@ ffpproot='/data/zhangxuehai/ffpp-faces/'
 # deeperforensics_root='/public/zhaohanqing/workspace/DeepfakeDetectionBench/datasets/deeper/'
 # fmfcc_root='/public/zhaohanqing/workspace/DeepfakeDetectionBench/datasets/fmfcc/'
 
+def get_mask():
+    n_holes = random.randint(1, 3)
+
+    while 1:
+
+        mask = np.ones((224, 224), np.float32)
+
+        for n in range(n_holes):
+            length = np.random.randint(1, 224)
+            width = np.random.randint(1, 224)
+            y = np.random.randint(224)
+            x = np.random.randint(224)
+            y1 = np.clip(y - length // 2, 0, 224)
+            y2 = np.clip(y + length // 2, 0, 224)
+            x1 = np.clip(x - width // 2, 0, 224)
+            x2 = np.clip(x + width // 2, 0, 224)
+            mask[y1: y2, x1: x2] = 0.
+
+        s = np.sum(mask == 0)
+
+        if s > 0.2 * 224 * 224 and s < 0.8 * 224 * 224:
+            break
+
+    return mask
+
 class ForensicsClips_new32(Dataset):
     """Dataset class for FaceForensics++, FaceShifter, and DeeperForensics. Supports returning only a subset of forgery
     methods in dataset"""
@@ -38,22 +63,18 @@ class ForensicsClips_new32(Dataset):
         self.grayscale = grayscale
         self.transform = transform
         self.clips_per_video = []
+        self.clip_idxs = []
 
         for ds_type in ds_types:
 
             # get list of video names
-            video_paths = os.path.join('/data/zhangxuehai/ffpp-faces/', ds_type, compression, 'clips')
+            video_paths = os.path.join('/data/zhangxuehai/ffpp-clips/', ds_type, compression, 'clips')
             if ds_type == 'Origin':
                 videos = sorted(real_videos)
-            elif ds_type == 'DeeperForensics':  # Extra processing for DeeperForensics videos due to naming differences
-                videos = []
-                for f in fake_videos:
-                    for el in os.listdir(video_paths):
-                        if el.startswith(f.split('_')[0]):
-                            videos.append(el)
-                videos = sorted(videos)
+                num = 48
             else:
                 videos = sorted(fake_videos)
+                num = 12
 
             self.videos_per_type[ds_type] = len(videos)
 
@@ -62,13 +83,15 @@ class ForensicsClips_new32(Dataset):
                 if not video in all_videos:
                     continue
                 path = os.path.join(video_paths, video)
-                num_clips = min(10, len(os.listdir(path)))
+                num_clips = min(num, len(os.listdir(path)))
+                clip_idxs = random.sample(range(len(os.listdir(path))), num_clips)
+                self.clip_idxs.append((clip_idxs))
                 self.clips_per_video.append(num_clips)
                 self.paths.append([path, ds_type])
 
         clip_lengths = torch.as_tensor(self.clips_per_video)
         self.cumulative_sizes = clip_lengths.cumsum(0).tolist()
-        
+
 
     def __len__(self):
         return self.cumulative_sizes[-1]
@@ -76,57 +99,32 @@ class ForensicsClips_new32(Dataset):
     def get_clip(self, idx):
         video_idx = bisect.bisect_right(self.cumulative_sizes, idx)
         if video_idx == 0:
-            clip_idx = idx
+            clip_idx = self.clip_idxs[video_idx][idx]
         else:
-            clip_idx = idx - self.cumulative_sizes[video_idx - 1]
-     
+            clip_idx = self.clip_idxs[video_idx][idx - self.cumulative_sizes[video_idx - 1]]
+        # print("video_id====",video_idx)
+        # print("clip_id====",clip_idx)
         item = self.paths[video_idx]
-        path =  item[0]
-        label =  0 if item[1] == 'Origin' else 1
-        
+        path = item[0]
+        label = 0 if item[1] == 'Origin' else 1
+
         sample = []
         frames_path = os.path.join(path, str(clip_idx).zfill(4))
         frames = os.listdir(frames_path)
-        n_holes = random.randint(1,3)
-        lengths = []
-        holes = []
-        while 1:
-            length0 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))
-            length1 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))  if n_holes>1 else 0
-            length2 = random.randint(1,math.floor(math.sqrt(0.8*224*224)))  if n_holes>2 else 0
-            s_all = length0**2+length1**2+length2**2
-            if s_all>0.2*224*224 and s_all<0.8*224*224:
-                lengths.append(length0)
-                lengths.append(length1)
-                lengths.append(length2)
-                break
-        
-        for n in range(n_holes):
-            y = np.random.randint(224)
-            x = np.random.randint(224)
-            length = lengths[n]
-            y1 = np.clip(y - length // 2, 0, 224)
-            y2 = np.clip(y + length // 2, 0, 224)
-            x1 = np.clip(x - length // 2, 0, 224)
-            x2 = np.clip(x + length // 2, 0, 224)
-            holes.append([y1,y2,x1,x2])
+        mask = get_mask()
+        mask = torch.from_numpy(mask)
+
         for item in frames[:self.frames_per_clip]:
             with Image.open(os.path.join(frames_path, item)) as pil_img:
                 if self.grayscale:
                     pil_img = pil_img.convert("L")
                 if self.transform is not None:
                     img = self.transform(pil_img)
-                    for n in range(n_holes):
-                        mask = np.ones((224, 224), np.float32)
-                        
-                        y1,y2,x1,x2 = holes[n]
-                        mask[y1: y2, x1: x2] = 0.
-                        mask = torch.from_numpy(mask)
-                        mask = mask.expand_as(img)
-                        img = img * mask
-                 
+                    mask = mask.expand_as(img)
+                    img = img * mask
+
             sample.append(img)
-        sample = torch.stack(sample,dim=1)
+        sample = torch.stack(sample, dim=1)
         
         return sample, frames_path.split('/')[-2], label
 
